@@ -173,46 +173,20 @@ struct Controls: View {
                     LazyVGrid(columns: Array(repeating: GridItem(.fixed(56), spacing: 6), count: 4), alignment: .leading, spacing: 6) {
                         ForEach(config.commands) { command in
                             let selected = command.publications.filter { $0.topic != nil }
-                            let messages = selected.compactMap { publication -> (topic: String, payload: String)? in
-                                guard let topic = config.topics.first(where: { $0.id == publication.topic && $0.isValid }),
+                            let messages = command.publications.compactMap { publication -> (topic: String, payload: String)? in
+                                guard let selectedTopic = publication.topic else { return nil }
+                                guard let topic = config.topics.first(where: { $0.id == selectedTopic && $0.isValid }),
                                       publication.payload.utf8.count <= 1_048_576 else { return nil }
                                 return (topic.path, publication.payload)
                             }
                             let name = command.name.isEmpty ? "Команда" : command.name
-                            Button {
-                                for message in messages {
-                                    mqtt.publish(topic: message.topic, payload: message.payload)
-                                }
-                            } label: {
-                                Text(name)
-                                    .font(.caption.weight(.semibold))
-                                    .lineLimit(1)
-                                    .padding(.horizontal, 5)
-                                    .frame(width: 56, height: 26)
-                                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                                    .overlay {
-                                        TimelineView(.animation(minimumInterval: 1, paused: false)) { timeline in
-                                            let remaining = mqtt.scheduleRemainingFraction(for: command.id, at: timeline.date)
-                                            if remaining > 0 {
-                                                CountdownBorder()
-                                                    .trim(from: 0, to: remaining)
-                                                    .stroke(.green, style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round))
-                                                    .allowsHitTesting(false)
-                                            }
-                                        }
-                                    }
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help(name)
-                            .overlay {
-                                if delayedPublishEnabled,
-                                   !messages.isEmpty, messages.count == selected.count {
-                                    SecondaryClick {
-                                        mqtt.scheduleInFiveMinutes(commandID: command.id, messages: messages)
-                                    }
-                                }
-                            }
+                            QuickCommandButton(
+                                name: name,
+                                commandID: command.id,
+                                messages: messages,
+                                mqtt: mqtt,
+                                delayedPublishEnabled: delayedPublishEnabled
+                            )
                             .opacity(messages.isEmpty || messages.count != selected.count || mqtt.status != .online ? 0.55 : 1)
                             .disabled(messages.isEmpty || messages.count != selected.count || mqtt.status != .online)
                         }
@@ -227,37 +201,79 @@ struct Controls: View {
     }
 }
 
-private struct SecondaryClick: NSViewRepresentable {
-    let action: () -> Void
+private struct QuickCommandButton: View {
+    let name: String
+    let commandID: UUID
+    let messages: [(topic: String, payload: String)]
+    @ObservedObject var mqtt: MQTT
+    let delayedPublishEnabled: Bool
 
-    func makeNSView(context: Context) -> ClickView { ClickView() }
+    @State private var holdStartedAt: Date?
+    @State private var holdTask: Task<Void, Never>?
+    @State private var holdTriggered = false
 
-    func updateNSView(_ view: ClickView, context: Context) {
-        view.action = action
+    var body: some View {
+        Text(name)
+            .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .frame(width: 56, height: 26)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                TimelineView(.animation(minimumInterval: 1, paused: false)) { timeline in
+                    let remaining = mqtt.scheduleRemainingFraction(for: commandID, at: timeline.date)
+                    if remaining > 0 {
+                        CountdownBorder()
+                            .trim(from: 0, to: remaining)
+                            .stroke(.green, style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round))
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in beginHoldIfNeeded() }
+                    .onEnded { _ in finishPress() }
+            )
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { publishImmediately() }
+            .help(delayedPublishEnabled ? "Нажать — выполнить сейчас; удерживать 2 секунды — выполнить через 5 минут" : name)
     }
 
-    final class ClickView: NSView {
-        var action: (() -> Void)? {
-            didSet { installRecognizerIfNeeded() }
+    private func beginHoldIfNeeded() {
+        guard holdStartedAt == nil else { return }
+        holdStartedAt = Date()
+        holdTriggered = false
+        guard delayedPublishEnabled else { return }
+        holdTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            holdTriggered = true
+            mqtt.scheduleInFiveMinutes(commandID: commandID, messages: messages)
         }
-        private var rightClickRecognizer: NSClickGestureRecognizer?
+    }
 
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            installRecognizerIfNeeded()
+    private func finishPress() {
+        let heldLongEnough = delayedPublishEnabled &&
+            (holdStartedAt.map { Date().timeIntervalSince($0) >= 2 } ?? false)
+        holdTask?.cancel()
+        holdTask = nil
+        if heldLongEnough {
+            if !holdTriggered, delayedPublishEnabled {
+                holdTriggered = true
+                mqtt.scheduleInFiveMinutes(commandID: commandID, messages: messages)
+            }
+        } else {
+            publishImmediately()
         }
+        holdStartedAt = nil
+        holdTriggered = false
+    }
 
-        private func installRecognizerIfNeeded() {
-            guard rightClickRecognizer == nil else { return }
-            let recognizer = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick))
-            recognizer.buttonMask = 1 << 1
-            recognizer.numberOfClicksRequired = 1
-            addGestureRecognizer(recognizer)
-            rightClickRecognizer = recognizer
-        }
-
-        @objc private func handleRightClick() {
-            action?()
+    private func publishImmediately() {
+        for message in messages {
+            mqtt.publish(topic: message.topic, payload: message.payload)
         }
     }
 }
