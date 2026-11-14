@@ -16,5 +16,10 @@ iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/LedBar.icns"
 cp Info.plist "$bundle/Contents/Info.plist"
 architecture="$(uname -m)"
 swiftc -O -target "$architecture-apple-macos14.0" Sources/*.swift -o "$bundle/Contents/MacOS/LedBar"
-codesign --force --sign - "$bundle"
+identity="${CODESIGN_IDENTITY:--}"
+if [[ "$identity" == "-" ]]; then
+    codesign --force --sign - "$bundle"
+else
+    codesign --force --options runtime --timestamp --sign "$identity" "$bundle"
+fi
 printf '%s\n' "$bundle"

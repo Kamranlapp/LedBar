@@ -10,12 +10,16 @@ final class MQTT: ObservableObject {
     }
 
     @Published private(set) var status = Status.offline
+    @Published private(set) var connectionCheck = 0
     @Published private(set) var levels = (try? JSONDecoder().decode(
         [UUID: Int].self, from: UserDefaults.standard.data(forKey: "brightnessLevels") ?? Data()
     )) ?? [:]
     private var stripTopics: [UUID: String] = [:]
     private var packetID: UInt16 = 0
-    @Published private(set) var scheduledCommands: Set<UUID> = []
+    @Published private(set) var scheduleDeadlines: [UUID: Date] = (try? JSONDecoder().decode(
+        [UUID: Date].self, from: UserDefaults.standard.data(forKey: "scheduleDeadlines") ?? Data()
+    )) ?? [:]
+    var scheduledCommands: Set<UUID> { Set(scheduleDeadlines.keys) }
     private var pendingCommand: UUID?
     private var pendingSchedule: Set<UInt16> = []
     private var scheduleTimeout: Task<Void, Never>?
@@ -24,10 +28,18 @@ final class MQTT: ObservableObject {
     private var timer: Task<Void, Never>?
     private var incoming = Data()
     private var awaitingPing = false
+    private var reconnectTask: Task<Void, Never>?
+    private var activeBroker: Broker?
+    private var activePassword = ""
+    private var reconnectDelay: Duration = .seconds(2)
+    private var manuallyDisconnected = false
     private var clientID = "LedBar-" + UUID().uuidString.prefix(16)
 
     func disconnect() {
         if isScheduling { finishSchedule() }
+        manuallyDisconnected = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
         timer?.cancel()
         timer = nil
         connection?.cancel()
@@ -38,7 +50,49 @@ final class MQTT: ObservableObject {
     }
 
     func connect(_ broker: Broker, password: String) {
-        disconnect()
+        manuallyDisconnected = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        activeBroker = broker
+        activePassword = password
+        reconnectDelay = .seconds(2)
+        openConnection(broker, password: password)
+    }
+
+    func checkConnection() {
+        guard status == .online else {
+            retryConnection()
+            return
+        }
+        connectionCheck &+= 1
+    }
+
+    func retryConnection() {
+        guard status != .online, status != .connecting, let activeBroker else { return }
+        manuallyDisconnected = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectDelay = .seconds(2)
+        status = .connecting
+        openConnection(activeBroker, password: activePassword)
+    }
+
+    func resumeAfterWake() {
+        guard !manuallyDisconnected, let activeBroker else { return }
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectDelay = .seconds(2)
+        status = .connecting
+        openConnection(activeBroker, password: activePassword)
+    }
+
+    private func openConnection(_ broker: Broker, password: String) {
+        timer?.cancel()
+        timer = nil
+        connection?.cancel()
+        connection = nil
+        incoming = Data()
+        awaitingPing = false
         let host = broker.host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty, let number = UInt16(broker.port), number > 0,
               let port = NWEndpoint.Port(rawValue: number),
@@ -137,7 +191,7 @@ final class MQTT: ObservableObject {
     func scheduleInFiveMinutes(commandID: UUID, messages: [(topic: String, payload: String)]) {
         guard status == .online, !isScheduling, !messages.isEmpty else { return }
         let delayedTopics = messages.map { "$delayed/300/" + $0.topic }
-        scheduledCommands.remove(commandID)
+        scheduleDeadlines.removeValue(forKey: commandID)
         guard delayedTopics.allSatisfy({ Topic(path: $0).isValid }) else { return }
         pendingCommand = commandID
 
@@ -153,6 +207,18 @@ final class MQTT: ObservableObject {
             try? await Task.sleep(for: .seconds(5))
             guard !Task.isCancelled else { return }
             self?.finishSchedule()
+        }
+    }
+
+    func scheduleRemainingFraction(for commandID: UUID, at date: Date = Date()) -> CGFloat {
+        guard let deadline = scheduleDeadlines[commandID] else { return 0 }
+        let remaining = deadline.timeIntervalSince(date)
+        return min(1, max(0, CGFloat(remaining / 300)))
+    }
+
+    private func saveScheduleDeadlines() {
+        if let data = try? JSONEncoder().encode(scheduleDeadlines) {
+            UserDefaults.standard.set(data, forKey: "scheduleDeadlines")
         }
     }
 
@@ -223,6 +289,9 @@ final class MQTT: ObservableObject {
                     fail(messages[Int(code)] ?? "Некорректный ответ на подключение.")
                     return
                 }
+                timer?.cancel()
+                timer = nil
+                reconnectDelay = .seconds(2)
                 status = .online
                 startKeepAlive()
                 updateSubscriptions(Set(stripTopics.values), subscribe: true)
@@ -231,7 +300,10 @@ final class MQTT: ObservableObject {
             } else if status == .online, header[0] == 0x40, length == 2 {
                 let identifier = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
                 if pendingSchedule.remove(identifier) != nil, pendingSchedule.isEmpty {
-                    if let pendingCommand { scheduledCommands.insert(pendingCommand) }
+                    if let pendingCommand {
+                        scheduleDeadlines[pendingCommand] = Date().addingTimeInterval(300)
+                        saveScheduleDeadlines()
+                    }
                     finishSchedule()
                 }
             } else if status == .online, header[0] == 0x90, length == 3 {
@@ -272,8 +344,29 @@ final class MQTT: ObservableObject {
     }
 
     private func fail(_ message: String) {
-        disconnect()
+        guard !manuallyDisconnected else { return }
+        timer?.cancel()
+        timer = nil
+        connection?.cancel()
+        connection = nil
+        incoming = Data()
+        awaitingPing = false
         status = .failed(message)
+        guard let broker = activeBroker else { return }
+        reconnectTask?.cancel()
+        let delay = reconnectDelay
+        reconnectDelay = min(reconnectDelay * 2, .seconds(30))
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let self, !self.manuallyDisconnected else { return }
+            self.status = .connecting
+            self.openConnection(broker, password: self.activePassword)
+            self.timer = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                guard !Task.isCancelled, let self, self.status == .connecting else { return }
+                self.fail("Брокер не ответил за 10 секунд.")
+            }
+        }
     }
 
     private static func field(_ string: String) -> Data {

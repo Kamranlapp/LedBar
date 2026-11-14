@@ -78,22 +78,41 @@ struct Configuration: Codable {
 }
 
 enum PasswordStore {
-    static let query: [String: Any] = [
+    private static func query(for broker: Broker) -> [String: Any] {
+        let account = [broker.tls ? "tls" : "tcp", broker.host, broker.port, broker.username]
+        let data = (try? JSONEncoder().encode(account)) ?? Data()
+        return query(account: data.base64EncodedString())
+    }
+
+    private static func query(account: String) -> [String: Any] { [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "com.kam.ledbar.mqtt",
-        kSecAttrAccount as String: "broker"
-    ]
+        kSecAttrAccount as String: account
+    ] }
 
-    static func read() -> String {
+    static func read(for broker: Broker) -> String {
+        read(query(for: broker)) ?? ""
+    }
+
+    static func migrateLegacy(for broker: Broker) {
+        let legacy = query(account: "broker")
+        guard !broker.host.isEmpty, let password = read(legacy) else { return }
+        if (read(query(for: broker)) != nil || write(password, for: broker)) {
+            SecItemDelete(legacy as CFDictionary)
+        }
+    }
+
+    private static func read(_ query: [String: Any]) -> String? {
         var request = query
         request[kSecReturnData as String] = true
         var result: CFTypeRef?
         guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return "" }
+              let data = result as? Data else { return nil }
         return String(decoding: data, as: UTF8.self)
     }
 
-    static func write(_ password: String) -> Bool {
+    static func write(_ password: String, for broker: Broker) -> Bool {
+        let query = query(for: broker)
         if password.isEmpty {
             let status = SecItemDelete(query as CFDictionary)
             return status == errSecSuccess || status == errSecItemNotFound

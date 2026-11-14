@@ -4,30 +4,37 @@ import SwiftUI
 struct LedBarApp: App {
     @NSApplicationDelegateAdaptor(LedBarDelegate.self) private var delegate
     private var mqtt: MQTT { delegate.mqtt }
-    @State private var config = Configuration.load()
+
 
     var body: some Scene {
         MenuBarExtra("LedBar", systemImage: "lightbulb.led") {
-            Controls(config: config, mqtt: mqtt)
+            SyncedControls(sync: delegate.sync, mqtt: mqtt)
                 .background(MenuWindowAnimation())
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            Preferences(config: $config, mqtt: mqtt)
-                .onChange(of: encodedConfiguration) { _, _ in
-                    config.save()
-                    mqtt.trackBrightness(in: config)
-                }
+            SyncedPreferences(sync: delegate.sync, mqtt: mqtt)
         }
     }
+}
 
-    private var encodedConfiguration: Data? {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .sortedKeys
-        return try? encoder.encode(config)
+private struct SyncedControls: View {
+    @ObservedObject var sync: ConfigurationSync
+    let mqtt: MQTT
+
+    var body: some View {
+        Controls(config: sync.config, mqtt: mqtt)
     }
+}
 
+private struct SyncedPreferences: View {
+    @ObservedObject var sync: ConfigurationSync
+    let mqtt: MQTT
+
+    var body: some View {
+        Preferences(config: Binding(get: { sync.config }, set: sync.update), mqtt: mqtt, sync: sync)
+    }
 }
 
 private struct MenuWindowAnimation: NSViewRepresentable {
@@ -54,11 +61,28 @@ private struct MenuWindowAnimation: NSViewRepresentable {
 @MainActor
 final class LedBarDelegate: NSObject, NSApplicationDelegate {
     let mqtt = MQTT()
+    let sync = ConfigurationSync()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let config = Configuration.load()
-        mqtt.trackBrightness(in: config)
-        if !config.broker.host.isEmpty { mqtt.connect(config.broker, password: PasswordStore.read()) }
+        var broker = sync.config.broker
+        PasswordStore.migrateLegacy(for: broker)
+        mqtt.trackBrightness(in: sync.config)
+        if !broker.host.isEmpty { mqtt.connect(broker, password: PasswordStore.read(for: broker)) }
+        sync.onChange = { [weak self] config, remote in
+            guard let self else { return }
+            self.mqtt.trackBrightness(in: config)
+            if broker != config.broker {
+                self.mqtt.connect(config.broker, password: PasswordStore.read(for: config.broker))
+            }
+            broker = config.broker
+        }
+        sync.start()
+        let notifications = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification] {
+            notifications.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.mqtt.resumeAfterWake() }
+            }
+        }
     }
 }
 
@@ -78,6 +102,11 @@ struct Controls: View {
         config.topics.first { $0.id == strip.topic && $0.isValid }
     }
 
+    private var delayedPublishEnabled: Bool {
+        config.broker.delayedPublishEnabled ??
+            (config.broker.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "broker.emqx.io")
+    }
+
     private func setLevel(_ level: Int, for strips: [Strip]) {
         for strip in strips {
             guard let topic = topic(for: strip) else { continue }
@@ -91,8 +120,10 @@ struct Controls: View {
                 Text("LedBar").font(.headline)
                 Spacer()
                 HStack(spacing: 9) {
-                    ConnectionStatus(mqtt: mqtt)
-                        .help(mqtt.status == .online ? "Подключён" : "Статус MQTT")
+                    ConnectionStatus(mqtt: mqtt) {
+                        mqtt.checkConnection()
+                    }
+                    .help(mqtt.status == .online ? "Подключён" : "Подключиться")
                     SettingsLink {
                         Label("Настройки", systemImage: "gearshape")
                     }
@@ -160,10 +191,14 @@ struct Controls: View {
                                     .frame(width: 56, height: 26)
                                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                                     .overlay {
-                                        if mqtt.scheduledCommands.contains(command.id) {
-                                            RoundedRectangle(cornerRadius: 8)
-                                                .strokeBorder(.green, lineWidth: 1)
-                                                .allowsHitTesting(false)
+                                        TimelineView(.animation(minimumInterval: 1, paused: false)) { timeline in
+                                            let remaining = mqtt.scheduleRemainingFraction(for: command.id, at: timeline.date)
+                                            if remaining > 0 {
+                                                CountdownBorder()
+                                                    .trim(from: 0, to: remaining)
+                                                    .stroke(.green, style: StrokeStyle(lineWidth: 1, lineCap: .round, lineJoin: .round))
+                                                    .allowsHitTesting(false)
+                                            }
                                         }
                                     }
                                     .contentShape(Rectangle())
@@ -171,7 +206,7 @@ struct Controls: View {
                             .buttonStyle(.plain)
                             .help(name)
                             .overlay {
-                                if config.broker.delayedPublishEnabled == true,
+                                if delayedPublishEnabled,
                                    !messages.isEmpty, messages.count == selected.count {
                                     SecondaryClick {
                                         mqtt.scheduleInFiveMinutes(commandID: command.id, messages: messages)
@@ -202,16 +237,58 @@ private struct SecondaryClick: NSViewRepresentable {
     }
 
     final class ClickView: NSView {
-        var action: (() -> Void)?
+        var action: (() -> Void)? {
+            didSet { installRecognizerIfNeeded() }
+        }
+        private var rightClickRecognizer: NSClickGestureRecognizer?
 
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            guard NSApp.currentEvent?.type == .rightMouseDown else { return nil }
-            return super.hitTest(point)
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            installRecognizerIfNeeded()
         }
 
-        override func rightMouseDown(with event: NSEvent) {
+        private func installRecognizerIfNeeded() {
+            guard rightClickRecognizer == nil else { return }
+            let recognizer = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick))
+            recognizer.buttonMask = 1 << 1
+            recognizer.numberOfClicksRequired = 1
+            addGestureRecognizer(recognizer)
+            rightClickRecognizer = recognizer
+        }
+
+        @objc private func handleRightClick() {
             action?()
         }
+    }
+}
+
+private struct CountdownBorder: Shape {
+    func path(in rect: CGRect) -> Path {
+        let radius = min(8, rect.height / 2, rect.width / 2)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.minY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX, y: rect.minY + radius),
+            control: CGPoint(x: rect.minX, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - radius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX + radius, y: rect.maxY),
+            control: CGPoint(x: rect.minX, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.maxY - radius),
+            control: CGPoint(x: rect.maxX, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + radius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX - radius, y: rect.minY),
+            control: CGPoint(x: rect.maxX, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.midX, y: rect.minY))
+        return path
     }
 }
 
@@ -278,14 +355,39 @@ struct BrightnessControl: View {
 
 struct ConnectionStatus: View {
     @ObservedObject var mqtt: MQTT
+    let retry: () -> Void
 
     var body: some View {
+        Button(action: retry) {
+            Group {
+                switch mqtt.status {
+                case .offline:
+                    Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                case .connecting:
+                    ProgressView().controlSize(.small)
+                case .online:
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12.6, weight: .black))
+                        .foregroundStyle(Color(red: 0.05, green: 0.68, blue: 0.27))
+                        .scaleEffect(x: 1.18, y: 1.05)
+                        .symbolEffect(.pulse, options: .speed(0.7), value: mqtt.connectionCheck)
+                case .failed:
+                    Image(systemName: "arrow.clockwise").foregroundStyle(.red)
+                }
+            }
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(statusHelp)
+    }
+
+    private var statusHelp: String {
         switch mqtt.status {
-        case .offline: Label("Отключён", systemImage: "circle").foregroundStyle(.secondary)
-        case .connecting: Label("Подключение…", systemImage: "ellipsis").foregroundStyle(.secondary)
-        case .online: Label("Подключён", systemImage: "checkmark").foregroundStyle(.green)
-        case .failed(let message):
-            Label("Ошибка", systemImage: "exclamationmark.circle").foregroundStyle(.red).help(message)
+        case .offline: "Отключён · нажмите для подключения"
+        case .connecting: "Подключение…"
+        case .online: "Подключён · нажмите для проверки"
+        case .failed(let message): "\(message) · нажмите для повтора"
         }
     }
 }
@@ -293,6 +395,7 @@ struct ConnectionStatus: View {
 struct Preferences: View {
     @Binding var config: Configuration
     @ObservedObject var mqtt: MQTT
+    @ObservedObject var sync: ConfigurationSync
     @State private var broker = Broker()
     @State private var password = ""
     @State private var error = ""
@@ -303,7 +406,10 @@ struct Preferences: View {
                 TextField("Адрес", text: $broker.host, prompt: Text("mqtt.example.com"))
                 TextField("Порт", text: $broker.port)
                 Toggle("Отложенная публикация EMQX", isOn: Binding(
-                    get: { broker.delayedPublishEnabled ?? false },
+                    get: {
+                        broker.delayedPublishEnabled ??
+                            (broker.host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "broker.emqx.io")
+                    },
                     set: { broker.delayedPublishEnabled = $0 }
                 ))
                 Toggle("TLS", isOn: $broker.tls)
@@ -314,7 +420,7 @@ struct Preferences: View {
                     Button("Отключить") { mqtt.disconnect() }
                         .disabled(mqtt.status == .offline)
                 }
-                ConnectionStatus(mqtt: mqtt)
+                ConnectionStatus(mqtt: mqtt) { mqtt.retryConnection() }
                 if !error.isEmpty { Text(error).foregroundStyle(.red) }
                 if case .failed(let message) = mqtt.status { Text(message).foregroundStyle(.red) }
             }
@@ -375,11 +481,34 @@ struct Preferences: View {
             }
             .formStyle(.grouped)
             .tabItem { Label("Команды", systemImage: "bolt") }
+            Form {
+                Text("Выберите одну и ту же папку в iCloud Drive на обоих Mac. Настройки подключения, топики и команды будут общими.")
+                if let folder = sync.folder {
+                    LabeledContent("Папка", value: folder.path)
+                    Text(sync.status)
+                    Button("Отключить синхронизацию") { sync.stop() }
+                }
+                Button("Выбрать папку в iCloud Drive…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = false
+                    panel.canChooseDirectories = true
+                    panel.canCreateDirectories = true
+                    panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
+                    if panel.runModal() == .OK, let url = panel.url { sync.select(url) }
+                }
+            }
+            .formStyle(.grouped)
+            .tabItem { Label("Синхронизация", systemImage: "icloud") }
         }
         .frame(width: 550, height: 440)
+        .onChange(of: config.broker) { _, updated in
+            broker = updated
+            password = PasswordStore.read(for: updated)
+        }
         .onAppear {
             broker = config.broker
-            password = PasswordStore.read()
+            password = PasswordStore.read(for: broker)
         }
     }
 
@@ -404,13 +533,13 @@ struct Preferences: View {
     }
 
     private func connect() {
-        guard PasswordStore.write(password) else {
+        guard PasswordStore.write(password, for: broker) else {
             error = "Не удалось сохранить пароль в Keychain."
             return
         }
         error = ""
         config.broker = broker
-        config.save()
+        sync.update(config)
         mqtt.connect(broker, password: password)
     }
 }

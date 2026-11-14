@@ -5,3 +5,5 @@ build/
 *.local
 *.key
 *.pem
+
+LedBar-settings.json
